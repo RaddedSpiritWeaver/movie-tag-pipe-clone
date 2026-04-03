@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
@@ -95,13 +97,17 @@ def collate_fn(batch):
     dim = frames[0].shape[1]
 
     padded = torch.zeros(len(frames), max_len, dim)
+    visual_padding_mask = torch.ones(len(frames), max_len, dtype=torch.bool)
 
     for i, f in enumerate(frames):
-        padded[i, :f.shape[0]] = f
+        seq_len = f.shape[0]
+        padded[i, :seq_len] = f
+        visual_padding_mask[i, :seq_len] = False
 
     return (
         list(sids),
         padded,
+        visual_padding_mask,
         torch.stack(ids),
         torch.stack(masks),
         torch.stack(labels),
@@ -255,13 +261,14 @@ def validate(model, loader, device, criterion, idx_to_tag, save_dir, epoch):
     with torch.no_grad():
         pbar = tqdm(loader, desc=f"Valid {epoch}", ncols=100)
 
-        for num, (sids, frames, ids, masks, labels) in enumerate(pbar):
+        for num, (sids, frames, visual_masks, ids, masks, labels) in enumerate(pbar):
             frames = frames.to(device)
+            visual_masks = visual_masks.to(device)
             ids = ids.to(device)
             masks = masks.to(device)
             labels = labels.to(device)
 
-            logits = model(frames, ids, masks)
+            logits = model(frames, visual_masks, ids, masks)
             loss = criterion(logits, labels)
             total_loss += loss.item()
 
@@ -387,14 +394,15 @@ def train(args):
         loss_sum = 0
 
         pbar = tqdm(train_loader, desc=f"Train {epoch}", ncols=100)
-        for num, (_, frames, ids, masks, labels) in enumerate(pbar):
+        for num, (_, frames, visual_masks, ids, masks, labels) in enumerate(pbar):
             frames = frames.to(device)
+            visual_masks = visual_masks.to(device)
             ids = ids.to(device)
             masks = masks.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(frames, ids, masks)
+            logits = model(frames, visual_masks, ids, masks)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()

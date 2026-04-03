@@ -9,29 +9,35 @@ class VisualTransformer(nn.Module):
         super().__init__()
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.pos_emb = nn.Parameter(torch.randn(1, 2048, dim))
+        self.pos_emb = nn.Parameter(torch.randn(1, 2048, dim) * 0.02)
+        nn.init.normal_(self.cls_token, std=0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim,
             nhead=heads,
             batch_first=True,
-            dropout=dropout
+            dropout=dropout,
+            norm_first=True
         )
 
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x):
+    def forward(self, x, padding_mask):
         B, N, D = x.shape
 
         cls = self.cls_token.expand(B, -1, -1)
         x = torch.cat([cls, x], dim=1)
 
+        cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
+        full_mask = torch.cat([cls_mask, padding_mask], dim=1)
+
         x = x + self.pos_emb[:, :N+1]
-        x = self.encoder(x)
+        x = self.encoder(x, src_key_padding_mask=full_mask)
 
         x = self.norm(x)
-        return x
+        
+        return x, full_mask
 
 
 class MultiModalSceneClassifier(nn.Module):
@@ -39,9 +45,7 @@ class MultiModalSceneClassifier(nn.Module):
         super().__init__()
         
         self.frame_encoder = VisualTransformer(clip_dim)
-        self.text_encoder = AutoModel.from_pretrained(
-            "distilbert-base-uncased"
-        )
+        self.text_encoder = AutoModel.from_pretrained("distilbert-base-uncased")
         text_dim = self.text_encoder.config.hidden_size
         self.text_proj = nn.Linear(text_dim, clip_dim)
         self.cross_attn = nn.MultiheadAttention(
@@ -54,26 +58,32 @@ class MultiModalSceneClassifier(nn.Module):
 
         self.head = nn.Sequential(
             nn.Linear(clip_dim, 512),
+            nn.LayerNorm(512),
             nn.GELU(),
             nn.Dropout(0.3),
             nn.Linear(512, num_tags),
         )
 
-        self.temperature = nn.Parameter(torch.ones(1))
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
 
-    def forward(self, frames, input_ids, attention_mask):
-        v_tokens = self.frame_encoder(frames)
+    def forward(self, frames, visual_masks, input_ids, attention_mask):
+        v_tokens, v_mask = self.frame_encoder(frames, visual_masks)
 
         text_out = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
+        t_cls = text_out.last_hidden_state[:, 0]
+        t_cls = self.text_proj(t_cls).unsqueeze(1)
 
-        t_tokens = text_out.last_hidden_state 
-        t_tokens = self.text_proj(t_tokens)
+        fused, _ = self.cross_attn(
+            query=t_cls,
+            key=v_tokens,
+            value=v_tokens,
+            key_padding_mask=v_mask
+        )
 
-        fused, _ = self.cross_attn(query=t_tokens, key=v_tokens, value=v_tokens)
-        fused = fused.mean(dim=1)
+        fused = self.norm(fused.squeeze(1))
         logits = self.head(fused)
 
         return logits / self.temperature
