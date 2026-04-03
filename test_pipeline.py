@@ -60,10 +60,16 @@ def collate_fn(batch):
     sids, frames, ids, masks = zip(*batch)
     max_len = max(f.shape[0] for f in frames)
     dim = frames[0].shape[1]
+    
     padded = torch.zeros(len(frames), max_len, dim)
+    visual_padding_mask = torch.ones(len(frames), max_len, dtype=torch.bool)
+    
     for i, f in enumerate(frames):
-        padded[i, :f.shape[0]] = f
-    return list(sids), padded, torch.stack(ids), torch.stack(masks)
+        seq_len = f.shape[0]
+        padded[i, :seq_len] = f
+        visual_padding_mask[i, :seq_len] = False
+        
+    return list(sids), padded, visual_padding_mask, torch.stack(ids), torch.stack(masks)
 
 
 def run(cmd):
@@ -290,8 +296,13 @@ def test(args):
     total_segments = 0
 
     with open(os.path.join(args.results_dir, "annotations.txt"), "w", encoding="utf-8") as f:
-        for sids, frames, ids, masks in tqdm(loader, desc="Classifying"):
-            logits = model(frames.to(device), ids.to(device), masks.to(device))
+        for sids, frames, visual_masks, ids, masks in tqdm(loader, desc="Classifying"):
+            logits = model(
+                frames.to(device), 
+                visual_masks.to(device), 
+                ids.to(device), 
+                masks.to(device)
+            )
             probs = torch.sigmoid(logits)[0].cpu().numpy()
 
             preds = sorted(

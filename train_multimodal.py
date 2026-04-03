@@ -360,7 +360,6 @@ def train(args):
     print(f"CLIP shape: {sample_emb.shape}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model = MultiModalSceneClassifier(clip_dim, len(tag_to_idx)).to(device)
 
     for p in model.text_encoder.parameters():
