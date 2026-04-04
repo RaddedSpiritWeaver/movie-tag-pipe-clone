@@ -386,7 +386,7 @@ def train(args):
         args.frames, args.texts, val_s2t, tag_to_idx, tokenizer
     )
 
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=4, persistent_workers=True, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=collate_fn, num_workers=4, persistent_workers=True, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
     sample_scene = train_ds.scenes[0]
@@ -500,7 +500,7 @@ if __name__ == "__main__":
     np.random.seed(42)
     random.seed(42)
 
-    # train(args)
+    train(args)
 
     if args.test_file is not None:
         test(args.test_file, args.save_dir)
