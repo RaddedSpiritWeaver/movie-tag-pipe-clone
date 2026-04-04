@@ -11,6 +11,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from glob import glob
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, hamming_loss
@@ -348,7 +349,7 @@ def test(input_file, output_path):
         "output_dir": os.path.join(output_path, "segments"),
         "model": os.path.join(output_path, "epoch_best.pt"),
         "tags": "data/label_selection.xlsx",
-        "results_dir": "results/pipeline",
+        "results_dir": os.path.join(output_path, "pipeline"),
         "segment_duration": 300,
         "silence_threshold": "-30dB",
         "prediction_threshold": 0,
@@ -406,8 +407,9 @@ def train(args):
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
     os.makedirs(args.save_dir, exist_ok=True)
-    shutil.copy("train_multimodal.py", args.save_dir)
-    shutil.copy("test_pipeline.py", args.save_dir)
+    for script_name in glob("*.py"):
+        shutil.copy(script_name, args.save_dir)
+        
     metrics_path = os.path.join(args.save_dir, "metrics.csv")
 
     with open(metrics_path, "w", newline="") as f:

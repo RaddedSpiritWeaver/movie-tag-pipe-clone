@@ -6,5 +6,4 @@ segments/
 data/movies/
 __pycache__/
 
-start_process.ps1
 process*.log
