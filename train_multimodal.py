@@ -359,7 +359,9 @@ def test(input_file, output_path):
         "min_tag_occurrances": 2,
         "min_tag_score": 0.05
     })
-    
+
+    os.makedirs(os.path.join(output_path, "segments"), exist_ok=True)
+
     print(f"Starting test on {input_file}...")
     start_test(test_args)
 

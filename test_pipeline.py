@@ -73,7 +73,14 @@ def collate_fn(batch):
 
 
 def run(cmd):
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(
+        cmd, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE, 
+        text=True,
+        encoding="utf-8",
+        errors="replace"
+    )
     return result.stdout, result.stderr
 
 
