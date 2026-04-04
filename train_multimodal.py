@@ -327,6 +327,42 @@ def validate(model, loader, device, criterion, idx_to_tag, save_dir, epoch):
     return val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, thresholds
 
 
+def test(input_file, output_path):
+    from test_pipeline import start_test
+    
+    class Map(dict):
+        def __init__(self, *args, **kwargs):
+            super(Map, self).__init__(*args, **kwargs)
+            for arg in args:
+                if isinstance(arg, dict):
+                    for k, v in arg.items():
+                        self[k] = v
+            if kwargs:
+                for k, v in kwargs.items():
+                    self[k] = v
+        def __getattr__(self, attr):
+            return self.get(attr)
+
+    test_args = Map({
+        "input_file": input_file,
+        "output_dir": os.path.join(output_path, "segments"),
+        "model": os.path.join(output_path, "epoch_best.pt"),
+        "tags": "data/label_selection.xlsx",
+        "results_dir": "results/pipeline",
+        "segment_duration": 300,
+        "silence_threshold": "-30dB",
+        "prediction_threshold": 0,
+        "silence_min_duration": 0.7,
+        "frame_stride": 10,
+        "clip_batch_size": 128,
+        "min_tag_occurrances": 2,
+        "min_tag_score": 0.05
+    })
+    
+    print(f"Starting test on {input_file}...")
+    start_test(test_args)
+
+
 def train(args):
     TAGS = (
         pd.read_excel(args.tags)["English Label"]
@@ -443,7 +479,7 @@ def train(args):
             if early_stop_count == args.early_stop:
                 break
         
-        time.sleep(5)
+        time.sleep(3)
 
 
 if __name__ == "__main__":
@@ -456,6 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--early_stop", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--test-file", default=None)
 
     args = parser.parse_args()
 
@@ -463,4 +500,7 @@ if __name__ == "__main__":
     np.random.seed(42)
     random.seed(42)
 
-    train(args)
+    # train(args)
+
+    if args.test_file is not None:
+        test(args.test_file, args.save_dir)

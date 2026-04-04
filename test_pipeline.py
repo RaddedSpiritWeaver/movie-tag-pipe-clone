@@ -83,8 +83,8 @@ def get_video_duration(file):
     return float(json.loads(out)["format"]["duration"])
 
 
-def detect_silences(file):
-    cmd = ["ffmpeg", "-i", file, "-af", f"silencedetect=noise={args.silence_threshold}:d={args.silence_min_duration}", "-f", "null", "-"]
+def detect_silences(file, threshold="-30dB", min_duration=0.7):
+    cmd = ["ffmpeg", "-i", file, "-af", f"silencedetect=noise={threshold}:d={min_duration}", "-f", "null", "-"]
     _, err = run(cmd)
     starts = [float(m.group(1)) for m in re.finditer(r"silence_start: (\d+\.?\d*)", err)]
     return starts
@@ -148,8 +148,8 @@ def get_best_streams(input_file, debug=True):
     return best_audio, best_sub
 
 
-def split_video(input_file, segments):
-    Path(args.output_dir).mkdir(exist_ok=True)
+def split_video(input_file, segments, output_dir):
+    Path(output_dir).mkdir(exist_ok=True)
 
     audio_idx, sub_idx = get_best_streams(input_file)
 
@@ -160,8 +160,8 @@ def split_video(input_file, segments):
 
     for i, (start, end) in enumerate(tqdm(segments, desc="Splitting Video")):
         duration = end - start
-        output_video = f"{args.output_dir}/segment_{i:03d}.mkv"
-        output_sub = f"{args.output_dir}/segment_{i:03d}.srt"
+        output_video = f"{output_dir}/segment_{i:03d}.mkv"
+        output_sub = f"{output_dir}/segment_{i:03d}.srt"
 
         if not os.path.exists(output_video):
             cmd = [
@@ -204,7 +204,11 @@ def split_video(input_file, segments):
 
 def segment_video(args):
     duration = get_video_duration(args.input_file)
-    silence_starts = detect_silences(args.input_file)
+    silence_starts = detect_silences(
+        args.input_file, 
+        threshold=args.silence_threshold, 
+        min_duration=args.silence_min_duration
+    )
     segments = []
     current_start = 0
     while current_start < duration:
@@ -215,7 +219,7 @@ def segment_video(args):
         cut_point = min(silence_starts, key=lambda x: abs(x - target)) if silence_starts else target
         segments.append((current_start, cut_point))
         current_start = cut_point
-    split_video(args.input_file, segments)
+    split_video(args.input_file, segments, args.output_dir)
 
 
 @torch.inference_mode()
@@ -362,7 +366,7 @@ def test(args):
             f.write("No dominant tags detected.\n")
 
 
-def main(args):
+def start_test(args):
     segment_video(args)
     embed_segments(args)
     test(args)
@@ -385,4 +389,4 @@ if __name__ == "__main__":
     parser.add_argument("--min-tag-score", default=0.05)
 
     args = parser.parse_args()
-    main(args)
+    start_test(args)
