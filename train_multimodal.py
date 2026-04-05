@@ -346,10 +346,9 @@ def test(input_file, output_path):
 
     test_args = Map({
         "input_file": input_file,
-        "output_dir": os.path.join(output_path, "segments"),
+        "output_dir": output_path,
         "model": os.path.join(output_path, "epoch_best.pt"),
         "tags": "data/label_selection.xlsx",
-        "results_dir": os.path.join(output_path, "pipeline"),
         "segment_duration": 300,
         "silence_threshold": "-30dB",
         "prediction_threshold": 0,
@@ -497,6 +496,7 @@ if __name__ == "__main__":
     parser.add_argument("--early_stop", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--test-file", default=None)
+    parser.add_argument("--test", action="store_true", help="Run in test mode")
 
     args = parser.parse_args()
 
@@ -504,7 +504,8 @@ if __name__ == "__main__":
     np.random.seed(42)
     random.seed(42)
 
-    train(args)
+    if not args.test:
+        train(args)
 
     if args.test_file is not None:
         test(args.test_file, args.save_dir)

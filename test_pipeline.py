@@ -279,8 +279,6 @@ def test(args):
     model.load_state_dict(torch.load(args.model, map_location=device))
     model.eval()
 
-    os.makedirs(args.results_dir, exist_ok=True)
-
     if float(args.prediction_threshold) == 0:
         model_dir = os.path.dirname(args.model)
         thresholds_path = os.path.join(model_dir, "best_thresholds.npy")
@@ -306,7 +304,8 @@ def test(args):
     tag_prob_sums = defaultdict(float)
     total_segments = 0
 
-    with open(os.path.join(args.results_dir, "annotations.txt"), "w", encoding="utf-8") as f:
+    results_file = os.path.join(args.output_dir, f"{args.movie_name}_results.txt")
+    with open(results_file, "w", encoding="utf-8") as f:
         for sids, frames, visual_masks, ids, masks in tqdm(loader, desc="Classifying"):
             logits = model(
                 frames.to(device), 
@@ -374,6 +373,12 @@ def test(args):
 
 
 def start_test(args):
+    args.movie_name = Path(args.input_file).stem
+    args.output_dir = os.path.join(args.output_dir, "segments", args.movie_name)
+    
+    print(f"Processing Movie: {args.movie_name}")
+    print(f"Output Directory: {args.output_dir}")
+
     segment_video(args)
     embed_segments(args)
     test(args)
@@ -382,10 +387,9 @@ def start_test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-file", type=str, required=True)
-    parser.add_argument("--output-dir", default="segments")
+    parser.add_argument("--output-dir", default="results")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--tags", default="data/label_selection.xlsx")
-    parser.add_argument("--results-dir", default="results/pipeline")
     parser.add_argument("--segment-duration", default=300)
     parser.add_argument("--silence-threshold", default="-30dB")
     parser.add_argument("--prediction-threshold", default=0.5, help="0 for auto")
