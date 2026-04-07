@@ -403,8 +403,7 @@ def train(args):
     for p in model.text_encoder.parameters():
         p.requires_grad = False
 
-    # criterion = nn.BCEWithLogitsLoss()
-    criterion = FocalLoss(gamma=2.0, alpha=0.25)
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
     os.makedirs(args.save_dir, exist_ok=True)

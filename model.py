@@ -64,8 +64,6 @@ class MultiModalSceneClassifier(nn.Module):
             nn.Linear(512, num_tags),
         )
 
-        # self.temperature = nn.Parameter(torch.ones(1) * 0.07)
-
     def forward(self, frames, visual_masks, input_ids, attention_mask):
         v_tokens, v_mask = self.frame_encoder(frames, visual_masks)
 
@@ -86,4 +84,4 @@ class MultiModalSceneClassifier(nn.Module):
         fused = self.norm(fused.squeeze(1))
         logits = self.head(fused)
 
-        return logits  # / self.temperature
+        return logits
