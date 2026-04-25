@@ -85,3 +85,25 @@ class MultiModalSceneClassifier(nn.Module):
         logits = self.head(fused)
 
         return logits
+
+
+class VisionSceneClassifier(nn.Module):
+    def __init__(self, clip_dim, num_tags):
+        super().__init__()
+
+        self.frame_encoder = VisualTransformer(clip_dim)
+
+        self.head = nn.Sequential(
+            nn.Linear(clip_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_tags),
+        )
+
+    def forward(self, frames, visual_masks):
+        v_tokens, v_mask = self.frame_encoder(frames, visual_masks)
+        v_cls = v_tokens[:, 0]
+        logits = self.head(v_cls)
+
+        return logits
