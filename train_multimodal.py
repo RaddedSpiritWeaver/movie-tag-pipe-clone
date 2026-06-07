@@ -3,6 +3,7 @@ import shutil
 import argparse
 import random
 import csv
+import json
 import time
 import torch
 import torch.nn as nn
@@ -404,84 +405,111 @@ def train(args):
         p.requires_grad = False
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    # optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    for script_name in glob("*.py"):
-        shutil.copy(script_name, args.save_dir)
+    # os.makedirs(args.save_dir, exist_ok=True)
+    # for script_name in glob("*.py"):
+    #     shutil.copy(script_name, args.save_dir)
         
-    metrics_path = os.path.join(args.save_dir, "metrics.csv")
+    # metrics_path = os.path.join(args.save_dir, "metrics.csv")
 
-    with open(metrics_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "epoch",
-            "train_loss",
-            "val_loss",
-            "val_precision_micro",
-            "val_recall_micro",
-            "val_f1_micro",
-            "val_hamming_acc"
-        ])
+    # with open(metrics_path, "w", newline="") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow([
+    #         "epoch",
+    #         "train_loss",
+    #         "val_loss",
+    #         "val_precision_micro",
+    #         "val_recall_micro",
+    #         "val_f1_micro",
+    #         "val_hamming_acc"
+    #     ])
 
-    best = 1e9
-    early_stop_count = 0
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        loss_sum = 0
+    # best = 1e9
+    # early_stop_count = 0
+    # for epoch in range(1, args.epochs + 1):
+    #     model.train()
+    #     loss_sum = 0
 
-        pbar = tqdm(train_loader, desc=f"Train {epoch}", ncols=100)
-        for num, (_, frames, visual_masks, ids, masks, labels) in enumerate(pbar):
-            frames = frames.to(device)
-            visual_masks = visual_masks.to(device)
-            ids = ids.to(device)
-            masks = masks.to(device)
-            labels = labels.to(device)
+    #     pbar = tqdm(train_loader, desc=f"Train {epoch}", ncols=100)
+    #     for num, (_, frames, visual_masks, ids, masks, labels) in enumerate(pbar):
+    #         frames = frames.to(device)
+    #         visual_masks = visual_masks.to(device)
+    #         ids = ids.to(device)
+    #         masks = masks.to(device)
+    #         labels = labels.to(device)
 
-            optimizer.zero_grad()
-            logits = model(frames, visual_masks, ids, masks)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
+    #         optimizer.zero_grad()
+    #         logits = model(frames, visual_masks, ids, masks)
+    #         loss = criterion(logits, labels)
+    #         loss.backward()
+    #         optimizer.step()
 
-            loss_sum += loss.item()
+    #         loss_sum += loss.item()
 
-            pbar.set_postfix({"train_loss": loss_sum / (num + 1), "ES counter": early_stop_count})
+    #         pbar.set_postfix({"train_loss": loss_sum / (num + 1), "ES counter": early_stop_count})
 
-        val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, thresholds = validate(
-            model, val_loader, device, criterion, idx_to_tag, args.save_dir, epoch
-        )
+    #     val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, thresholds = validate(
+    #         model, val_loader, device, criterion, idx_to_tag, args.save_dir, epoch
+    #     )
 
-        with open(metrics_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                epoch,
-                loss_sum / len(train_loader),
-                val_loss,
-                precision_micro,
-                recall_micro,
-                f1_micro,
-                hamming_acc
-            ])
+    #     with open(metrics_path, "a", newline="") as f:
+    #         writer = csv.writer(f)
+    #         writer.writerow([
+    #             epoch,
+    #             loss_sum / len(train_loader),
+    #             val_loss,
+    #             precision_micro,
+    #             recall_micro,
+    #             f1_micro,
+    #             hamming_acc
+    #         ])
 
-        torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_latest.pt"))
-        save_plot(metrics_path)
+    #     torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_latest.pt"))
+    #     save_plot(metrics_path)
 
-        if val_loss < best:
-            best = val_loss
+    #     if val_loss < best:
+    #         best = val_loss
 
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_best.pt"))
-            np.save(os.path.join(args.save_dir, "best_thresholds.npy"), thresholds)
+    #         torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_best.pt"))
+    #         np.save(os.path.join(args.save_dir, "best_thresholds.npy"), thresholds)
 
-            if args.early_stop != 0:
-                early_stop_count = 0
+    #         if args.early_stop != 0:
+    #             early_stop_count = 0
 
-        elif args.early_stop != 0:
-            early_stop_count += 1
-            if early_stop_count == args.early_stop:
-                break
-        
-        time.sleep(3)
+    #     elif args.early_stop != 0:
+    #         early_stop_count += 1
+    #         if early_stop_count == args.early_stop:
+    #             break
+
+    #     time.sleep(3)
+
+    final_validate(model, val_loader, device, criterion, idx_to_tag, args.save_dir)
+
+
+def final_validate(model, val_loader, device, criterion, idx_to_tag, save_dir):
+    best_path = os.path.join(save_dir, "epoch_best.pt")
+    print(f"\nLoading best model from {best_path} for final validation...")
+    model.load_state_dict(torch.load(best_path, map_location=device))
+
+    val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, _ = validate(
+        model, val_loader, device, criterion, idx_to_tag, save_dir, "best"
+    )
+
+    final_metrics = {
+        "val_loss": val_loss,
+        "val_precision_micro": precision_micro,
+        "val_recall_micro": recall_micro,
+        "val_f1_micro": f1_micro,
+        "val_hamming_acc": hamming_acc,
+    }
+
+    with open(os.path.join(save_dir, "final_metrics.json"), "w") as f:
+        json.dump(final_metrics, f, indent=2)
+
+    print("Final validation metrics (best model):")
+    for k, v in final_metrics.items():
+        print(f"  {k}: {v:.4f}")
 
 
 if __name__ == "__main__":
