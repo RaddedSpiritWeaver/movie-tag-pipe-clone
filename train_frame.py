@@ -309,6 +309,7 @@ def test(input_file, output_path):
         "output_dir": output_path,
         "model": os.path.join(output_path, "epoch_best.pt"),
         "tags": "data/label_selection.xlsx",
+        "model_type": "frame",
         "segment_duration": 300,
         "silence_threshold": "-30dB",
         "prediction_threshold": 0,
@@ -427,8 +428,8 @@ if __name__ == "__main__":
     parser.add_argument("--annotations", default="./data/annotations.txt")
     parser.add_argument("--tags", default="./data/label_selection.xlsx")
     parser.add_argument("--save-dir", required=True)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--early_stop", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--early_stop", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--test-file", default=None)
     parser.add_argument("--test", action="store_true", help="Run in test mode")

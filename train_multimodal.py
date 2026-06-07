@@ -398,7 +398,7 @@ def train(args):
     print(f"CLIP shape: {sample_emb.shape}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiModalSceneClassifier(clip_dim, len(tag_to_idx)).to(device)
+    model = MultiModalSceneClassifier(clip_dim, len(tag_to_idx), fusion=args.fusion).to(device)
 
     for p in model.text_encoder.parameters():
         p.requires_grad = False
@@ -491,9 +491,10 @@ if __name__ == "__main__":
     parser.add_argument("--annotations", default="./data/annotations.txt")
     parser.add_argument("--tags", default="./data/label_selection.xlsx")
     parser.add_argument("--save-dir", required=True)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--early_stop", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--early_stop", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--fusion", default="cross_attn", choices=["cross_attn", "concat", "add", "film"])
     parser.add_argument("--test-file", default=None)
     parser.add_argument("--test", action="store_true", help="Run in test mode")
 
