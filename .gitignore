@@ -7,3 +7,4 @@ data/movies/
 __pycache__/
 
 process*.log
+cookies.txt

@@ -15,7 +15,7 @@ from glob import glob
 from collections import defaultdict
 from transformers import AutoTokenizer
 
-from model import MultiModalSceneClassifier
+from model import MultiModalSceneClassifier, TextSceneClassifier, VisionSceneClassifier
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -60,16 +60,45 @@ def collate_fn(batch):
     sids, frames, ids, masks = zip(*batch)
     max_len = max(f.shape[0] for f in frames)
     dim = frames[0].shape[1]
-    
+
     padded = torch.zeros(len(frames), max_len, dim)
     visual_padding_mask = torch.ones(len(frames), max_len, dtype=torch.bool)
-    
+
     for i, f in enumerate(frames):
         seq_len = f.shape[0]
         padded[i, :seq_len] = f
         visual_padding_mask[i, :seq_len] = False
-        
+
     return list(sids), padded, visual_padding_mask, torch.stack(ids), torch.stack(masks)
+
+
+class SceneTextInferenceDataset(Dataset):
+    def __init__(self, text_dir, tokenizer, max_len=512):
+        self.text_dir = Path(text_dir)
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+        self.ids = sorted(p.stem for p in self.text_dir.glob("segment_*.txt"))
+        assert len(self.ids) > 0, f"No .txt segments found in {text_dir}"
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        sid = self.ids[idx]
+        with open(self.text_dir / f"{sid}.txt", encoding="utf-8") as f:
+            text = f.read()
+
+        enc = self.tokenizer(
+            text, truncation=True, padding="max_length",
+            max_length=self.max_len, return_tensors="pt"
+        )
+        return sid, enc["input_ids"].squeeze(0), enc["attention_mask"].squeeze(0)
+
+
+def text_collate_fn(batch):
+    sids, ids, masks = zip(*batch)
+    return list(sids), torch.stack(ids), torch.stack(masks)
 
 
 def run(cmd):
@@ -272,10 +301,20 @@ def test(args):
     idx_to_tag = {i: t for i, t in enumerate(TAGS)}
 
     tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-    dataset = SceneInferenceDataset(args.output_dir, args.output_dir, tokenizer)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    model_type = getattr(args, "model_type", "multimodal")
 
-    model = MultiModalSceneClassifier(dataset.clip_dim, len(TAGS)).to(device)
+    if model_type == "text":
+        dataset = SceneTextInferenceDataset(args.output_dir, tokenizer)
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=text_collate_fn)
+        model = TextSceneClassifier(len(TAGS)).to(device)
+    else:
+        dataset = SceneInferenceDataset(args.output_dir, args.output_dir, tokenizer)
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+        if model_type == "frame":
+            model = VisionSceneClassifier(dataset.clip_dim, len(TAGS)).to(device)
+        else:
+            model = MultiModalSceneClassifier(dataset.clip_dim, len(TAGS)).to(device)
+
     model.load_state_dict(torch.load(args.model, map_location=device))
     model.eval()
 
@@ -306,13 +345,16 @@ def test(args):
 
     results_file = os.path.join(args.output_dir, f"{args.movie_name}_results.txt")
     with open(results_file, "w", encoding="utf-8") as f:
-        for sids, frames, visual_masks, ids, masks in tqdm(loader, desc="Classifying"):
-            logits = model(
-                frames.to(device), 
-                visual_masks.to(device), 
-                ids.to(device), 
-                masks.to(device)
-            )
+        for batch in tqdm(loader, desc="Classifying"):
+            if model_type == "text":
+                sids, ids, masks = batch
+                logits = model(ids.to(device), masks.to(device))
+            elif model_type == "frame":
+                sids, frames, visual_masks, ids, masks = batch
+                logits = model(frames.to(device), visual_masks.to(device))
+            else:
+                sids, frames, visual_masks, ids, masks = batch
+                logits = model(frames.to(device), visual_masks.to(device), ids.to(device), masks.to(device))
             probs = torch.sigmoid(logits)[0].cpu().numpy()
 
             preds = sorted(

@@ -40,19 +40,29 @@ class VisualTransformer(nn.Module):
         return x, full_mask
 
 
+FUSION_OPTIONS = ("cross_attn", "concat", "add", "film")
+
+
 class MultiModalSceneClassifier(nn.Module):
-    def __init__(self, clip_dim, num_tags):
+    def __init__(self, clip_dim, num_tags, fusion="cross_attn"):
         super().__init__()
-        
+        assert fusion in FUSION_OPTIONS, f"fusion must be one of {FUSION_OPTIONS}"
+        self.fusion = fusion
+
         self.frame_encoder = VisualTransformer(clip_dim)
         self.text_encoder = AutoModel.from_pretrained("distilbert-base-uncased")
         text_dim = self.text_encoder.config.hidden_size
         self.text_proj = nn.Linear(text_dim, clip_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=clip_dim,
-            num_heads=8,
-            batch_first=True
-        )
+
+        if fusion == "cross_attn":
+            self.cross_attn = nn.MultiheadAttention(embed_dim=clip_dim, num_heads=8, batch_first=True)
+        elif fusion == "concat":
+            self.fusion_proj = nn.Linear(clip_dim * 2, clip_dim)
+        elif fusion == "film":
+            # text generates per-dimension scale and shift to modulate visual
+            self.film_scale = nn.Linear(clip_dim, clip_dim)
+            self.film_shift = nn.Linear(clip_dim, clip_dim)
+        # "add" needs no extra layers
 
         self.norm = nn.LayerNorm(clip_dim)
 
@@ -66,25 +76,48 @@ class MultiModalSceneClassifier(nn.Module):
 
     def forward(self, frames, visual_masks, input_ids, attention_mask):
         v_tokens, v_mask = self.frame_encoder(frames, visual_masks)
+        v_cls = v_tokens[:, 0]
 
-        text_out = self.text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
+        text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        t_cls = self.text_proj(text_out.last_hidden_state[:, 0])
+
+        if self.fusion == "cross_attn":
+            fused, _ = self.cross_attn(
+                query=t_cls.unsqueeze(1),
+                key=v_tokens,
+                value=v_tokens,
+                key_padding_mask=v_mask,
+            )
+            fused = self.norm(fused.squeeze(1))
+        elif self.fusion == "concat":
+            fused = self.norm(self.fusion_proj(torch.cat([v_cls, t_cls], dim=-1)))
+        elif self.fusion == "add":
+            fused = self.norm(v_cls + t_cls)
+        elif self.fusion == "film":
+            scale = self.film_scale(t_cls)
+            shift = self.film_shift(t_cls)
+            fused = self.norm(scale * v_cls + shift)
+
+        return self.head(fused)
+
+
+class TextSceneClassifier(nn.Module):
+    def __init__(self, num_tags):
+        super().__init__()
+        self.text_encoder = AutoModel.from_pretrained("distilbert-base-uncased")
+        text_dim = self.text_encoder.config.hidden_size
+        self.head = nn.Sequential(
+            nn.Linear(text_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_tags),
         )
-        t_cls = text_out.last_hidden_state[:, 0]
-        t_cls = self.text_proj(t_cls).unsqueeze(1)
 
-        fused, _ = self.cross_attn(
-            query=t_cls,
-            key=v_tokens,
-            value=v_tokens,
-            key_padding_mask=v_mask
-        )
-
-        fused = self.norm(fused.squeeze(1))
-        logits = self.head(fused)
-
-        return logits
+    def forward(self, input_ids, attention_mask):
+        text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        cls = text_out.last_hidden_state[:, 0]
+        return self.head(cls)
 
 
 class VisionSceneClassifier(nn.Module):
