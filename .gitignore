@@ -1,6 +1,6 @@
 .venv/
 venv/
-results/
+results*/
 extracted_data/
 segments/
 data/movies/

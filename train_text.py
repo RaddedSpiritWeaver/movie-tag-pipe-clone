@@ -18,7 +18,7 @@ from tqdm import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, hamming_loss
 from transformers import AutoTokenizer
 
-from model import TextSceneClassifier
+from model import TextSceneClassifier, set_text_trainable
 
 
 class SceneTextDataset(Dataset):
@@ -352,75 +352,86 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TextSceneClassifier(len(tag_to_idx)).to(device)
 
-    for p in model.text_encoder.parameters():
-        p.requires_grad = False
+    set_text_trainable(model.text_encoder, args.unfreeze_text_layers)
+
+    text_params = [p for p in model.text_encoder.parameters() if p.requires_grad]
+    other_params = [
+        p for n, p in model.named_parameters()
+        if p.requires_grad and not n.startswith("text_encoder.")
+    ]
+    print(f"Trainable text-encoder layers: {args.unfreeze_text_layers} "
+          f"({sum(p.numel() for p in text_params):,} params)")
+
+    param_groups = [{"params": other_params, "lr": args.lr}]
+    if text_params:
+        param_groups.append({"params": text_params, "lr": args.text_lr})
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    optimizer = torch.optim.AdamW(param_groups)
 
-    # os.makedirs(args.save_dir, exist_ok=True)
-    # for script_name in glob("*.py"):
-    #     shutil.copy(script_name, args.save_dir)
+    os.makedirs(args.save_dir, exist_ok=True)
+    for script_name in glob("*.py"):
+        shutil.copy(script_name, args.save_dir)
 
-    # metrics_path = os.path.join(args.save_dir, "metrics.csv")
+    metrics_path = os.path.join(args.save_dir, "metrics.csv")
 
-    # with open(metrics_path, "w", newline="") as f:
-    #     writer = csv.writer(f)
-    #     writer.writerow([
-    #         "epoch", "train_loss", "val_loss",
-    #         "val_precision_micro", "val_recall_micro",
-    #         "val_f1_micro", "val_hamming_acc"
-    #     ])
+    with open(metrics_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "epoch", "train_loss", "val_loss",
+            "val_precision_micro", "val_recall_micro",
+            "val_f1_micro", "val_hamming_acc"
+        ])
 
-    # best = 1e9
-    # early_stop_count = 0
-    # for epoch in range(1, args.epochs + 1):
-    #     model.train()
-    #     loss_sum = 0
+    best = -1.0
+    early_stop_count = 0
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        loss_sum = 0
 
-    #     pbar = tqdm(train_loader, desc=f"Train {epoch}", ncols=100)
-    #     for num, (_, ids, masks, labels) in enumerate(pbar):
-    #         ids = ids.to(device)
-    #         masks = masks.to(device)
-    #         labels = labels.to(device)
+        pbar = tqdm(train_loader, desc=f"Train {epoch}", ncols=100)
+        for num, (_, ids, masks, labels) in enumerate(pbar):
+            ids = ids.to(device)
+            masks = masks.to(device)
+            labels = labels.to(device)
 
-    #         optimizer.zero_grad()
-    #         logits = model(ids, masks)
-    #         loss = criterion(logits, labels)
-    #         loss.backward()
-    #         optimizer.step()
+            optimizer.zero_grad()
+            logits = model(ids, masks)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
 
-    #         loss_sum += loss.item()
-    #         pbar.set_postfix({"train_loss": loss_sum / (num + 1), "ES counter": early_stop_count})
+            loss_sum += loss.item()
+            pbar.set_postfix({"train_loss": loss_sum / (num + 1), "ES counter": early_stop_count})
 
-    #     val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, thresholds = validate(
-    #         model, val_loader, device, criterion, idx_to_tag, args.save_dir, epoch
-    #     )
+        val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, thresholds = validate(
+            model, val_loader, device, criterion, idx_to_tag, args.save_dir, epoch
+        )
 
-    #     with open(metrics_path, "a", newline="") as f:
-    #         writer = csv.writer(f)
-    #         writer.writerow([
-    #             epoch, loss_sum / len(train_loader), val_loss,
-    #             precision_micro, recall_micro, f1_micro, hamming_acc
-    #         ])
+        with open(metrics_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch, loss_sum / len(train_loader), val_loss,
+                precision_micro, recall_micro, f1_micro, hamming_acc
+            ])
 
-    #     torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_latest.pt"))
-    #     save_plot(metrics_path)
+        torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_latest.pt"))
+        save_plot(metrics_path)
 
-    #     if val_loss < best:
-    #         best = val_loss
-    #         torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_best.pt"))
-    #         np.save(os.path.join(args.save_dir, "best_thresholds.npy"), thresholds)
+        if f1_micro > best:
+            best = f1_micro
+            torch.save(model.state_dict(), os.path.join(args.save_dir, "epoch_best.pt"))
+            np.save(os.path.join(args.save_dir, "best_thresholds.npy"), thresholds)
 
-    #         if args.early_stop != 0:
-    #             early_stop_count = 0
+            if args.early_stop != 0:
+                early_stop_count = 0
 
-    #     elif args.early_stop != 0:
-    #         early_stop_count += 1
-    #         if early_stop_count == args.early_stop:
-    #             break
+        elif args.early_stop != 0:
+            early_stop_count += 1
+            if early_stop_count == args.early_stop:
+                break
 
-    #     time.sleep(1)
+        time.sleep(1)
 
     final_validate(model, val_loader, device, criterion, idx_to_tag, args.save_dir)
 
@@ -459,6 +470,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--early_stop", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--unfreeze-text-layers", type=int, default=2,
+                        help="Number of top DistilBERT transformer blocks to fine-tune (0 = frozen)")
+    parser.add_argument("--text-lr", type=float, default=2e-5,
+                        help="Learning rate for the unfrozen text-encoder layers")
     parser.add_argument("--test-file", default=None)
     parser.add_argument("--test", action="store_true", help="Run in test mode")
 

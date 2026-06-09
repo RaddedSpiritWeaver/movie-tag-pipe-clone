@@ -4,6 +4,25 @@ import torch.nn as nn
 from transformers import AutoModel
 
 
+def masked_mean_pool(last_hidden_state, attention_mask):
+    """Mean-pool token embeddings, ignoring padding positions."""
+    mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
+    summed = (last_hidden_state * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1e-9)
+    return summed / counts
+
+
+def set_text_trainable(text_encoder, num_layers):
+    """Freeze the text encoder, then unfreeze its top `num_layers` transformer blocks."""
+    for p in text_encoder.parameters():
+        p.requires_grad = False
+    if num_layers and num_layers > 0:
+        layers = text_encoder.transformer.layer
+        for layer in layers[-num_layers:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+
 class VisualTransformer(nn.Module):
     def __init__(self, dim, depth=2, heads=8, dropout=0.2):
         super().__init__()
@@ -62,6 +81,12 @@ class MultiModalSceneClassifier(nn.Module):
             # text generates per-dimension scale and shift to modulate visual
             self.film_scale = nn.Linear(clip_dim, clip_dim)
             self.film_shift = nn.Linear(clip_dim, clip_dim)
+            # identity init: scale->1, shift->0 so fusion starts as a pure
+            # visual pass-through and learns text modulation gradually
+            nn.init.zeros_(self.film_scale.weight)
+            nn.init.ones_(self.film_scale.bias)
+            nn.init.zeros_(self.film_shift.weight)
+            nn.init.zeros_(self.film_shift.bias)
         # "add" needs no extra layers
 
         self.norm = nn.LayerNorm(clip_dim)
@@ -79,7 +104,8 @@ class MultiModalSceneClassifier(nn.Module):
         v_cls = v_tokens[:, 0]
 
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        t_cls = self.text_proj(text_out.last_hidden_state[:, 0])
+        t_pooled = masked_mean_pool(text_out.last_hidden_state, attention_mask)
+        t_cls = self.text_proj(t_pooled)
 
         if self.fusion == "cross_attn":
             fused, _ = self.cross_attn(
@@ -116,8 +142,8 @@ class TextSceneClassifier(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls = text_out.last_hidden_state[:, 0]
-        return self.head(cls)
+        pooled = masked_mean_pool(text_out.last_hidden_state, attention_mask)
+        return self.head(pooled)
 
 
 class VisionSceneClassifier(nn.Module):
