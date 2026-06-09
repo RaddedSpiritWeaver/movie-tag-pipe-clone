@@ -9,13 +9,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-# metric key -> display label; order defines plot/table column order
+# metric suffix -> display label; order defines plot/table column order.
+# values are looked up with a "test_" prefix first, then "val_" for old runs.
 METRICS = [
-    ("val_f1_micro", "F1"),
-    ("val_precision_micro", "Precision"),
-    ("val_recall_micro", "Recall"),
-    ("val_hamming_acc", "Hamming Acc"),
+    ("f1_micro", "F1"),
+    ("precision_micro", "Precision"),
+    ("recall_micro", "Recall"),
+    ("hamming_acc", "Hamming Acc"),
 ]
+
+
+def get_metric(run, suffix):
+    for prefix in ("test_", "val_"):
+        if prefix + suffix in run:
+            return run[prefix + suffix]
+    return None
 
 
 def load_results(results_dir):
@@ -36,16 +44,16 @@ def print_table(runs):
     print("-" * len(header))
 
     # rank by F1 (descending) for readability
-    for method in sorted(methods, key=lambda m: runs[m].get("val_f1_micro", 0), reverse=True):
+    for method in sorted(methods, key=lambda m: get_metric(runs[m], "f1_micro") or 0, reverse=True):
         row = method.ljust(name_w)
-        for key, _ in METRICS:
-            val = runs[method].get(key)
+        for suffix, _ in METRICS:
+            val = get_metric(runs[method], suffix)
             row += f"{val:>14.4f}" if val is not None else f"{'-':>14}"
         print(row)
 
 
 def plot_results(runs, out_path):
-    methods = sorted(runs.keys(), key=lambda m: runs[m].get("val_f1_micro", 0), reverse=True)
+    methods = sorted(runs.keys(), key=lambda m: get_metric(runs[m], "f1_micro") or 0, reverse=True)
     n_metrics = len(METRICS)
     n_methods = len(methods)
 
@@ -56,7 +64,7 @@ def plot_results(runs, out_path):
 
     for i, method in enumerate(methods):
         offset = (i - (n_methods - 1) / 2) * width
-        vals = [runs[method].get(key, 0) for key, _ in METRICS]
+        vals = [get_metric(runs[method], suffix) or 0 for suffix, _ in METRICS]
         bars = ax.bar(x + offset, vals, width, label=method)
         for b, v in zip(bars, vals):
             ax.text(b.get_x() + b.get_width() / 2, v + 0.005,

@@ -92,18 +92,24 @@ def collate_fn(batch):
     )
 
 
-def split_train_val(scene_to_tags, val_fraction=0.1, seed=42):
+def split_train_val_test(scene_to_tags, val_fraction=0.05, test_fraction=0.10, seed=42):
     random.seed(seed)
     scene_ids = list(scene_to_tags.keys())
     random.shuffle(scene_ids)
 
-    n_val = int(len(scene_ids) * val_fraction)
-    val_ids = set(scene_ids[:n_val])
-    train_ids = set(scene_ids[n_val:])
+    n_total = len(scene_ids)
+    n_test = int(n_total * test_fraction)
+    n_val = int(n_total * val_fraction)
+
+    # test slice first so it stays fixed regardless of the val fraction
+    test_ids = set(scene_ids[:n_test])
+    val_ids = set(scene_ids[n_test:n_test + n_val])
+    train_ids = set(scene_ids[n_test + n_val:])
 
     return (
         {k: scene_to_tags[k] for k in train_ids},
         {k: scene_to_tags[k] for k in val_ids},
+        {k: scene_to_tags[k] for k in test_ids},
     )
 
 
@@ -220,7 +226,7 @@ def tune_thresholds(all_true, all_probs, min_support=5, min_precision=0.6, min_t
     return np.array(thresholds)
 
 
-def validate(model, loader, device, criterion, idx_to_tag, save_dir, epoch):
+def validate(model, loader, device, criterion, idx_to_tag, save_dir, epoch, thresholds=None):
     model.eval()
     os.makedirs(save_dir, exist_ok=True)
 
@@ -253,7 +259,8 @@ def validate(model, loader, device, criterion, idx_to_tag, save_dir, epoch):
     all_true = np.vstack(all_true)
     all_probs = np.vstack(all_probs)
 
-    thresholds = tune_thresholds(all_true, all_probs)
+    if thresholds is None:
+        thresholds = tune_thresholds(all_true, all_probs)
     all_pred = (all_probs > thresholds).astype(int)
 
     precision_micro = precision_score(all_true, all_pred, average="micro", zero_division=0)
@@ -339,15 +346,17 @@ def train(args):
     TAGS = sorted(TAGS)
 
     scene_to_tags, tag_to_idx, idx_to_tag = load_annotations(args.annotations, TAGS)
-    train_s2t, val_s2t = split_train_val(scene_to_tags)
+    train_s2t, val_s2t, test_s2t = split_train_val_test(scene_to_tags)
 
     tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 
     train_ds = SceneTextDataset(args.texts, train_s2t, tag_to_idx, tokenizer)
     val_ds = SceneTextDataset(args.texts, val_s2t, tag_to_idx, tokenizer)
+    test_ds = SceneTextDataset(args.texts, test_s2t, tag_to_idx, tokenizer)
 
     train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=collate_fn, num_workers=4, persistent_workers=True, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TextSceneClassifier(len(tag_to_idx)).to(device)
@@ -433,30 +442,33 @@ def train(args):
 
         time.sleep(1)
 
-    final_validate(model, val_loader, device, criterion, idx_to_tag, args.save_dir)
+    final_test(model, test_loader, device, criterion, idx_to_tag, args.save_dir)
 
 
-def final_validate(model, val_loader, device, criterion, idx_to_tag, save_dir):
+def final_test(model, test_loader, device, criterion, idx_to_tag, save_dir):
     best_path = os.path.join(save_dir, "epoch_best.pt")
-    print(f"\nLoading best model from {best_path} for final validation...")
+    print(f"\nLoading best model from {best_path} for final test...")
     model.load_state_dict(torch.load(best_path, map_location=device))
 
-    val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, _ = validate(
-        model, val_loader, device, criterion, idx_to_tag, save_dir, "best"
+    # use the thresholds tuned on validation (re-tuning on test would leak)
+    thresholds = np.load(os.path.join(save_dir, "best_thresholds.npy"))
+
+    test_loss, precision_micro, recall_micro, f1_micro, hamming_acc, _ = validate(
+        model, test_loader, device, criterion, idx_to_tag, save_dir, "test", thresholds=thresholds
     )
 
     final_metrics = {
-        "val_loss": val_loss,
-        "val_precision_micro": precision_micro,
-        "val_recall_micro": recall_micro,
-        "val_f1_micro": f1_micro,
-        "val_hamming_acc": hamming_acc,
+        "test_loss": test_loss,
+        "test_precision_micro": precision_micro,
+        "test_recall_micro": recall_micro,
+        "test_f1_micro": f1_micro,
+        "test_hamming_acc": hamming_acc,
     }
 
     with open(os.path.join(save_dir, "final_metrics.json"), "w") as f:
         json.dump(final_metrics, f, indent=2)
 
-    print("Final validation metrics (best model):")
+    print("Final test metrics (best model, val-tuned thresholds):")
     for k, v in final_metrics.items():
         print(f"  {k}: {v:.4f}")
 
