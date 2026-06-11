@@ -15,7 +15,7 @@ from glob import glob
 from collections import defaultdict
 from transformers import AutoTokenizer
 
-from model import MultiModalSceneClassifier, TextSceneClassifier, VisionSceneClassifier
+from model import MultiModalSceneClassifier, TextSceneClassifier, VisionSceneClassifier, DEFAULT_TEXT_MODEL
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -300,20 +300,21 @@ def test(args):
     TAGS = sorted(["No label"] + tags_df)
     idx_to_tag = {i: t for i, t in enumerate(TAGS)}
 
-    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+    text_model = getattr(args, "text_model", DEFAULT_TEXT_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(text_model)
     model_type = getattr(args, "model_type", "multimodal")
 
     if model_type == "text":
         dataset = SceneTextInferenceDataset(args.output_dir, tokenizer)
         loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=text_collate_fn)
-        model = TextSceneClassifier(len(TAGS)).to(device)
+        model = TextSceneClassifier(len(TAGS), text_model=text_model).to(device)
     else:
         dataset = SceneInferenceDataset(args.output_dir, args.output_dir, tokenizer)
         loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
         if model_type == "frame":
             model = VisionSceneClassifier(dataset.clip_dim, len(TAGS)).to(device)
         else:
-            model = MultiModalSceneClassifier(dataset.clip_dim, len(TAGS)).to(device)
+            model = MultiModalSceneClassifier(dataset.clip_dim, len(TAGS), text_model=text_model).to(device)
 
     model.load_state_dict(torch.load(args.model, map_location=device))
     model.eval()
@@ -431,6 +432,8 @@ if __name__ == "__main__":
     parser.add_argument("--input-file", type=str, required=True)
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL,
+                        help="Text encoder used at train time (must match the checkpoint)")
     parser.add_argument("--tags", default="data/label_selection.xlsx")
     parser.add_argument("--segment-duration", default=300)
     parser.add_argument("--silence-threshold", default="-30dB")

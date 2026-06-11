@@ -4,6 +4,12 @@ import torch.nn as nn
 from transformers import AutoModel
 
 
+# Sentence-Transformers model: trained so mean-pooled output is a strong
+# sentence/paragraph embedding. Much better frozen representation than vanilla
+# distilbert-base-uncased, and a 768-dim drop-in replacement.
+DEFAULT_TEXT_MODEL = "sentence-transformers/all-mpnet-base-v2"
+
+
 def masked_mean_pool(last_hidden_state, attention_mask):
     """Mean-pool token embeddings, ignoring padding positions."""
     mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
@@ -12,12 +18,21 @@ def masked_mean_pool(last_hidden_state, attention_mask):
     return summed / counts
 
 
+def _transformer_layers(text_encoder):
+    """Return the ModuleList of transformer blocks across HF architectures."""
+    if hasattr(text_encoder, "encoder") and hasattr(text_encoder.encoder, "layer"):
+        return text_encoder.encoder.layer        # BERT / RoBERTa / MPNet / MiniLM
+    if hasattr(text_encoder, "transformer") and hasattr(text_encoder.transformer, "layer"):
+        return text_encoder.transformer.layer    # DistilBERT
+    raise ValueError("Unsupported text encoder architecture for partial unfreezing")
+
+
 def set_text_trainable(text_encoder, num_layers):
     """Freeze the text encoder, then unfreeze its top `num_layers` transformer blocks."""
     for p in text_encoder.parameters():
         p.requires_grad = False
     if num_layers and num_layers > 0:
-        layers = text_encoder.transformer.layer
+        layers = _transformer_layers(text_encoder)
         for layer in layers[-num_layers:]:
             for p in layer.parameters():
                 p.requires_grad = True
@@ -63,13 +78,13 @@ FUSION_OPTIONS = ("cross_attn", "concat", "add", "film")
 
 
 class MultiModalSceneClassifier(nn.Module):
-    def __init__(self, clip_dim, num_tags, fusion="cross_attn"):
+    def __init__(self, clip_dim, num_tags, fusion="cross_attn", text_model=DEFAULT_TEXT_MODEL):
         super().__init__()
         assert fusion in FUSION_OPTIONS, f"fusion must be one of {FUSION_OPTIONS}"
         self.fusion = fusion
 
         self.frame_encoder = VisualTransformer(clip_dim)
-        self.text_encoder = AutoModel.from_pretrained("distilbert-base-uncased")
+        self.text_encoder = AutoModel.from_pretrained(text_model)
         text_dim = self.text_encoder.config.hidden_size
         self.text_proj = nn.Linear(text_dim, clip_dim)
 
@@ -128,9 +143,9 @@ class MultiModalSceneClassifier(nn.Module):
 
 
 class TextSceneClassifier(nn.Module):
-    def __init__(self, num_tags):
+    def __init__(self, num_tags, text_model=DEFAULT_TEXT_MODEL):
         super().__init__()
-        self.text_encoder = AutoModel.from_pretrained("distilbert-base-uncased")
+        self.text_encoder = AutoModel.from_pretrained(text_model)
         text_dim = self.text_encoder.config.hidden_size
         self.head = nn.Sequential(
             nn.Linear(text_dim, 512),

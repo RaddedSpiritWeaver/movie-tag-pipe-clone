@@ -18,7 +18,7 @@ from tqdm import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, hamming_loss
 from transformers import AutoTokenizer
 
-from model import TextSceneClassifier, set_text_trainable
+from model import TextSceneClassifier, set_text_trainable, DEFAULT_TEXT_MODEL
 
 
 class SceneTextDataset(Dataset):
@@ -297,7 +297,7 @@ def validate(model, loader, device, criterion, idx_to_tag, save_dir, epoch, thre
     return val_loss, precision_micro, recall_micro, f1_micro, hamming_acc, thresholds
 
 
-def test(input_file, output_path):
+def test(input_file, output_path, text_model=DEFAULT_TEXT_MODEL):
     from test_pipeline import start_test
 
     class Map(dict):
@@ -319,6 +319,7 @@ def test(input_file, output_path):
         "model": os.path.join(output_path, "epoch_best.pt"),
         "tags": "data/label_selection.xlsx",
         "model_type": "text",
+        "text_model": text_model,
         "segment_duration": 300,
         "silence_threshold": "-30dB",
         "prediction_threshold": 0,
@@ -348,7 +349,7 @@ def train(args):
     scene_to_tags, tag_to_idx, idx_to_tag = load_annotations(args.annotations, TAGS)
     train_s2t, val_s2t, test_s2t = split_train_val_test(scene_to_tags)
 
-    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained(args.text_model)
 
     train_ds = SceneTextDataset(args.texts, train_s2t, tag_to_idx, tokenizer)
     val_ds = SceneTextDataset(args.texts, val_s2t, tag_to_idx, tokenizer)
@@ -359,7 +360,7 @@ def train(args):
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TextSceneClassifier(len(tag_to_idx)).to(device)
+    model = TextSceneClassifier(len(tag_to_idx), text_model=args.text_model).to(device)
 
     set_text_trainable(model.text_encoder, args.unfreeze_text_layers)
 
@@ -482,8 +483,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--early_stop", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL,
+                        help="HuggingFace text encoder (default: a Sentence-Transformers model)")
     parser.add_argument("--unfreeze-text-layers", type=int, default=2,
-                        help="Number of top DistilBERT transformer blocks to fine-tune (0 = frozen)")
+                        help="Number of top text transformer blocks to fine-tune (0 = frozen)")
     parser.add_argument("--text-lr", type=float, default=2e-5,
                         help="Learning rate for the unfrozen text-encoder layers")
     parser.add_argument("--test-file", default=None)
@@ -499,4 +502,4 @@ if __name__ == "__main__":
         train(args)
 
     if args.test_file is not None:
-        test(args.test_file, args.save_dir)
+        test(args.test_file, args.save_dir, args.text_model)
