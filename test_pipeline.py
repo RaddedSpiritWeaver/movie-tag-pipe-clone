@@ -8,35 +8,50 @@ import argparse
 import numpy as np
 import cv2 as cv
 import pandas as pd
+import librosa
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from tqdm import tqdm
 from glob import glob
 from collections import defaultdict
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, ClapModel, ClapProcessor
 
-from model import MultiModalSceneClassifier, TextSceneClassifier, VisionSceneClassifier, DEFAULT_TEXT_MODEL
+from model import (
+    MultiModalSceneClassifier, TextSceneClassifier, VisionSceneClassifier,
+    AudioSceneClassifier, DEFAULT_TEXT_MODEL,
+)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+CLAP_MODEL = "laion/clap-htsat-unfused"
+AUDIO_CHUNK_SECONDS = 10
+AUDIO_BATCH_CHUNKS = 16
+
 class SceneInferenceDataset(Dataset):
-    def __init__(self, embed_dir, text_dir, tokenizer, max_len=512):
+    def __init__(self, embed_dir, text_dir, tokenizer, max_len=512, audio_dir=None):
         self.embed_dir = Path(embed_dir)
         self.text_dir = Path(text_dir)
+        self.audio_dir = Path(audio_dir) if audio_dir is not None else None
         self.tokenizer = tokenizer
         self.max_len = max_len
 
         self.ids = [
             p.stem
             for p in self.embed_dir.glob("segment_*.npy")
-            if (self.text_dir / f"{p.stem}.txt").exists()
+            if not p.stem.endswith(".audio")
+            and (self.text_dir / f"{p.stem}.txt").exists()
+            and (self.audio_dir is None or (self.audio_dir / f"{p.stem}.audio.npy").exists())
         ]
-        
+
         self.ids.sort()
         assert len(self.ids) > 0, f"No matching npy/txt pairs found in {embed_dir}"
 
         first_emb = np.load(self.embed_dir / f"{self.ids[0]}.npy")
         self.clip_dim = first_emb.shape[1]
+
+        self.audio_dim = None
+        if self.audio_dir is not None:
+            self.audio_dim = np.load(self.audio_dir / f"{self.ids[0]}.audio.npy").shape[1]
 
     def __len__(self):
         return len(self.ids)
@@ -53,23 +68,61 @@ class SceneInferenceDataset(Dataset):
             max_length=self.max_len, return_tensors="pt"
         )
 
-        return sid, frames, enc["input_ids"].squeeze(0), enc["attention_mask"].squeeze(0)
+        if self.audio_dir is None:
+            return sid, frames, enc["input_ids"].squeeze(0), enc["attention_mask"].squeeze(0)
+
+        audio = torch.tensor(np.load(self.audio_dir / f"{sid}.audio.npy"), dtype=torch.float32)
+        return sid, frames, enc["input_ids"].squeeze(0), enc["attention_mask"].squeeze(0), audio
+
+
+def _pad_sequence(seqs):
+    max_len = max(s.shape[0] for s in seqs)
+    dim = seqs[0].shape[1]
+    padded = torch.zeros(len(seqs), max_len, dim)
+    padding_mask = torch.ones(len(seqs), max_len, dtype=torch.bool)
+    for i, s in enumerate(seqs):
+        padded[i, :s.shape[0]] = s
+        padding_mask[i, :s.shape[0]] = False
+    return padded, padding_mask
 
 
 def collate_fn(batch):
     sids, frames, ids, masks = zip(*batch)
-    max_len = max(f.shape[0] for f in frames)
-    dim = frames[0].shape[1]
-
-    padded = torch.zeros(len(frames), max_len, dim)
-    visual_padding_mask = torch.ones(len(frames), max_len, dtype=torch.bool)
-
-    for i, f in enumerate(frames):
-        seq_len = f.shape[0]
-        padded[i, :seq_len] = f
-        visual_padding_mask[i, :seq_len] = False
-
+    padded, visual_padding_mask = _pad_sequence(frames)
     return list(sids), padded, visual_padding_mask, torch.stack(ids), torch.stack(masks)
+
+
+def multimodal_collate_fn(batch):
+    sids, frames, ids, masks, audio = zip(*batch)
+    padded, visual_padding_mask = _pad_sequence(frames)
+    audio_padded, audio_padding_mask = _pad_sequence(audio)
+    return (list(sids), padded, visual_padding_mask, torch.stack(ids),
+            torch.stack(masks), audio_padded, audio_padding_mask)
+
+
+class SceneAudioInferenceDataset(Dataset):
+    def __init__(self, audio_dir):
+        self.audio_dir = Path(audio_dir)
+        self.ids = sorted(
+            p.stem[:-len(".audio")]
+            for p in self.audio_dir.glob("segment_*.audio.npy")
+        )
+        assert len(self.ids) > 0, f"No .audio.npy segments found in {audio_dir}"
+        self.audio_dim = np.load(self.audio_dir / f"{self.ids[0]}.audio.npy").shape[1]
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        sid = self.ids[idx]
+        audio = torch.tensor(np.load(self.audio_dir / f"{sid}.audio.npy"), dtype=torch.float32)
+        return sid, audio
+
+
+def audio_collate_fn(batch):
+    sids, audio = zip(*batch)
+    audio_padded, audio_padding_mask = _pad_sequence(audio)
+    return list(sids), audio_padded, audio_padding_mask
 
 
 class SceneTextInferenceDataset(Dataset):
@@ -294,6 +347,52 @@ def embed_segments(args):
             np.save(output_path, torch.cat(all_embs).numpy())
 
 
+@torch.inference_mode()
+def embed_audio_segments(args):
+    """CLAP audio-embedding sequence per video segment -> segment_*.audio.npy."""
+    clap = ClapModel.from_pretrained(CLAP_MODEL).to(device).eval()
+    processor = ClapProcessor.from_pretrained(CLAP_MODEL)
+    sr = processor.feature_extractor.sampling_rate
+    chunk_len = AUDIO_CHUNK_SECONDS * sr
+    min_len = sr
+
+    segments = sorted(glob(os.path.join(args.output_dir, "segment_*.mkv")))
+    for video in tqdm(segments, desc="Audio embedding"):
+        output_path = video.replace(".mkv", ".audio.npy")
+        if os.path.exists(output_path):
+            continue
+
+        # extract the segment audio to a temp wav, then load at CLAP's rate
+        wav_path = video.replace(".mkv", ".clap.wav")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video,
+             "-vn", "-ac", "1", "-ar", str(sr), str(wav_path)],
+            check=False,
+        )
+        if not os.path.exists(wav_path):
+            np.save(output_path, np.zeros((1, clap.config.projection_dim), dtype="float32"))
+            continue
+        wav, _ = librosa.load(wav_path, sr=sr, mono=True)
+        os.remove(wav_path)
+        if wav.size < min_len:
+            wav = np.zeros(min_len, dtype=np.float32)
+
+        chunks = [wav[s:s + chunk_len] for s in range(0, len(wav), chunk_len)]
+        chunks = [c for c in chunks if len(c) >= min_len] or [wav]
+
+        embs = []
+        for i in range(0, len(chunks), AUDIO_BATCH_CHUNKS):
+            group = chunks[i:i + AUDIO_BATCH_CHUNKS]
+            inp = processor(audio=group, sampling_rate=sr, return_tensors="pt")
+            inp = {k: v.to(device) for k, v in inp.items()}
+            pooled = clap.audio_model(**inp).pooler_output
+            e = clap.audio_projection(pooled)
+            e = e / e.norm(dim=-1, keepdim=True)
+            embs.append(e.cpu())
+
+        np.save(output_path, torch.cat(embs).numpy().astype("float32"))
+
+
 @torch.no_grad()
 def test(args):
     tags_df = pd.read_excel(args.tags)["English Label"].dropna().astype(str).unique().tolist()
@@ -308,13 +407,18 @@ def test(args):
         dataset = SceneTextInferenceDataset(args.output_dir, tokenizer)
         loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=text_collate_fn)
         model = TextSceneClassifier(len(TAGS), text_model=text_model).to(device)
-    else:
+    elif model_type == "audio":
+        dataset = SceneAudioInferenceDataset(args.output_dir)
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=audio_collate_fn)
+        model = AudioSceneClassifier(dataset.audio_dim, len(TAGS)).to(device)
+    elif model_type == "frame":
         dataset = SceneInferenceDataset(args.output_dir, args.output_dir, tokenizer)
         loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
-        if model_type == "frame":
-            model = VisionSceneClassifier(dataset.clip_dim, len(TAGS)).to(device)
-        else:
-            model = MultiModalSceneClassifier(dataset.clip_dim, len(TAGS), text_model=text_model).to(device)
+        model = VisionSceneClassifier(dataset.clip_dim, len(TAGS)).to(device)
+    else:
+        dataset = SceneInferenceDataset(args.output_dir, args.output_dir, tokenizer, audio_dir=args.output_dir)
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=multimodal_collate_fn)
+        model = MultiModalSceneClassifier(dataset.clip_dim, len(TAGS), dataset.audio_dim, text_model=text_model).to(device)
 
     model.load_state_dict(torch.load(args.model, map_location=device))
     model.eval()
@@ -350,12 +454,16 @@ def test(args):
             if model_type == "text":
                 sids, ids, masks = batch
                 logits = model(ids.to(device), masks.to(device))
+            elif model_type == "audio":
+                sids, audio, audio_masks = batch
+                logits = model(audio.to(device), audio_masks.to(device))
             elif model_type == "frame":
                 sids, frames, visual_masks, ids, masks = batch
                 logits = model(frames.to(device), visual_masks.to(device))
             else:
-                sids, frames, visual_masks, ids, masks = batch
-                logits = model(frames.to(device), visual_masks.to(device), ids.to(device), masks.to(device))
+                sids, frames, visual_masks, ids, masks, audio, audio_masks = batch
+                logits = model(frames.to(device), visual_masks.to(device), ids.to(device),
+                               masks.to(device), audio.to(device), audio_masks.to(device))
             probs = torch.sigmoid(logits)[0].cpu().numpy()
 
             preds = sorted(
@@ -422,8 +530,13 @@ def start_test(args):
     print(f"Processing Movie: {args.movie_name}")
     print(f"Output Directory: {args.output_dir}")
 
+    model_type = getattr(args, "model_type", "multimodal")
+
     segment_video(args)
-    embed_segments(args)
+    if model_type != "audio":
+        embed_segments(args)
+    if model_type in ("audio", "multimodal"):
+        embed_audio_segments(args)
     test(args)
 
 
@@ -434,6 +547,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL,
                         help="Text encoder used at train time (must match the checkpoint)")
+    parser.add_argument("--model-type", default="multimodal",
+                        choices=["frame", "text", "audio", "multimodal"],
+                        help="Must match how the checkpoint was trained")
     parser.add_argument("--tags", default="data/label_selection.xlsx")
     parser.add_argument("--segment-duration", default=300)
     parser.add_argument("--silence-threshold", default="-30dB")

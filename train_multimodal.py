@@ -22,9 +22,10 @@ from model import MultiModalSceneClassifier, set_text_trainable, DEFAULT_TEXT_MO
 
 
 class SceneMultiModalDataset(Dataset):
-    def __init__(self, embed_dir, text_dir, scene_to_tags, tag_to_idx, tokenizer, max_len=512):
+    def __init__(self, embed_dir, text_dir, audio_dir, scene_to_tags, tag_to_idx, tokenizer, max_len=512):
         self.embed_dir = embed_dir
         self.text_dir = text_dir
+        self.audio_dir = audio_dir
         self.scene_to_tags = scene_to_tags
         self.tag_to_idx = tag_to_idx
         self.scenes = sorted(scene_to_tags.keys())
@@ -36,6 +37,7 @@ class SceneMultiModalDataset(Dataset):
             sid for sid in self.scenes
             if os.path.exists(os.path.join(embed_dir, f"{sid}.npy"))
             and os.path.exists(os.path.join(text_dir, f"{sid}.txt"))
+            and os.path.exists(os.path.join(audio_dir, f"{sid}.npy"))
         ]
 
     def __len__(self):
@@ -46,6 +48,11 @@ class SceneMultiModalDataset(Dataset):
 
         frames = torch.tensor(
             np.load(os.path.join(self.embed_dir, f"{sid}.npy")),
+            dtype=torch.float32
+        )
+
+        audio = torch.tensor(
+            np.load(os.path.join(self.audio_dir, f"{sid}.npy")),
             dtype=torch.float32
         )
 
@@ -69,6 +76,7 @@ class SceneMultiModalDataset(Dataset):
             frames,
             enc["input_ids"].squeeze(0),
             enc["attention_mask"].squeeze(0),
+            audio,
             labels,
         )
 
@@ -114,19 +122,27 @@ def compute_pos_weight(scenes, scene_to_tags, tag_to_idx, clip=10.0):
     return torch.tensor(weight, dtype=torch.float32)
 
 
+def _pad_sequence(seqs):
+    """Pad a tuple of (len, dim) tensors to a batch + boolean padding mask."""
+    max_len = max(s.shape[0] for s in seqs)
+    dim = seqs[0].shape[1]
+
+    padded = torch.zeros(len(seqs), max_len, dim)
+    padding_mask = torch.ones(len(seqs), max_len, dtype=torch.bool)
+
+    for i, s in enumerate(seqs):
+        seq_len = s.shape[0]
+        padded[i, :seq_len] = s
+        padding_mask[i, :seq_len] = False
+
+    return padded, padding_mask
+
+
 def collate_fn(batch):
-    sids, frames, ids, masks, labels = zip(*batch)
+    sids, frames, ids, masks, audio, labels = zip(*batch)
 
-    max_len = max(f.shape[0] for f in frames)
-    dim = frames[0].shape[1]
-
-    padded = torch.zeros(len(frames), max_len, dim)
-    visual_padding_mask = torch.ones(len(frames), max_len, dtype=torch.bool)
-
-    for i, f in enumerate(frames):
-        seq_len = f.shape[0]
-        padded[i, :seq_len] = f
-        visual_padding_mask[i, :seq_len] = False
+    padded, visual_padding_mask = _pad_sequence(frames)
+    audio_padded, audio_padding_mask = _pad_sequence(audio)
 
     return (
         list(sids),
@@ -134,6 +150,8 @@ def collate_fn(batch):
         visual_padding_mask,
         torch.stack(ids),
         torch.stack(masks),
+        audio_padded,
+        audio_padding_mask,
         torch.stack(labels),
     )
 
@@ -291,14 +309,16 @@ def validate(model, loader, device, criterion, idx_to_tag, save_dir, epoch, thre
     with torch.no_grad():
         pbar = tqdm(loader, desc=f"Valid {epoch}", ncols=100)
 
-        for num, (sids, frames, visual_masks, ids, masks, labels) in enumerate(pbar):
+        for num, (sids, frames, visual_masks, ids, masks, audio, audio_masks, labels) in enumerate(pbar):
             frames = frames.to(device)
             visual_masks = visual_masks.to(device)
             ids = ids.to(device)
             masks = masks.to(device)
+            audio = audio.to(device)
+            audio_masks = audio_masks.to(device)
             labels = labels.to(device)
 
-            logits = model(frames, visual_masks, ids, masks)
+            logits = model(frames, visual_masks, ids, masks, audio, audio_masks)
             loss = criterion(logits, labels)
             total_loss += loss.item()
 
@@ -413,13 +433,13 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.text_model)
 
     train_ds = SceneMultiModalDataset(
-        args.frames, args.texts, train_s2t, tag_to_idx, tokenizer
+        args.frames, args.texts, args.audios, train_s2t, tag_to_idx, tokenizer
     )
     val_ds = SceneMultiModalDataset(
-        args.frames, args.texts, val_s2t, tag_to_idx, tokenizer
+        args.frames, args.texts, args.audios, val_s2t, tag_to_idx, tokenizer
     )
     test_ds = SceneMultiModalDataset(
-        args.frames, args.texts, test_s2t, tag_to_idx, tokenizer
+        args.frames, args.texts, args.audios, test_s2t, tag_to_idx, tokenizer
     )
 
     train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=collate_fn, num_workers=4, persistent_workers=True, pin_memory=True)
@@ -429,11 +449,12 @@ def train(args):
     sample_scene = train_ds.scenes[0]
     sample_emb = np.load(os.path.join(args.frames, f"{sample_scene}.npy"))
     clip_dim = sample_emb.shape[1]
+    audio_dim = np.load(os.path.join(args.audios, f"{sample_scene}.npy")).shape[1]
 
-    print(f"CLIP shape: {sample_emb.shape}")
+    print(f"CLIP shape: {sample_emb.shape} | audio dim: {audio_dim}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiModalSceneClassifier(clip_dim, len(tag_to_idx), fusion=args.fusion, text_model=args.text_model).to(device)
+    model = MultiModalSceneClassifier(clip_dim, len(tag_to_idx), audio_dim, fusion=args.fusion, text_model=args.text_model).to(device)
 
     set_text_trainable(model.text_encoder, args.unfreeze_text_layers)
 
@@ -487,15 +508,17 @@ def train(args):
         loss_sum = 0
 
         pbar = tqdm(train_loader, desc=f"Train {epoch}", ncols=100)
-        for num, (_, frames, visual_masks, ids, masks, labels) in enumerate(pbar):
+        for num, (_, frames, visual_masks, ids, masks, audio, audio_masks, labels) in enumerate(pbar):
             frames = frames.to(device)
             visual_masks = visual_masks.to(device)
             ids = ids.to(device)
             masks = masks.to(device)
+            audio = audio.to(device)
+            audio_masks = audio_masks.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(frames, visual_masks, ids, masks)
+            logits = model(frames, visual_masks, ids, masks, audio, audio_masks)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
@@ -574,6 +597,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--frames", default="./extracted_data/embeddings")
     parser.add_argument("--texts", default="./extracted_data/texts")
+    parser.add_argument("--audios", default="./extracted_data/audio_embeddings")
     parser.add_argument("--annotations", default="./data/annotations.txt")
     parser.add_argument("--tags", default="./data/label_selection.xlsx")
     parser.add_argument("--save-dir", required=True)

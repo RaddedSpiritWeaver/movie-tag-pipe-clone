@@ -10,12 +10,16 @@ import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from pathlib import Path
-from transformers import pipeline
+from transformers import pipeline, ClapModel, ClapProcessor
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 output_root = "data/embeddings_clip"
 model_name = "ViT-L/14"  # or "ViT-B/16"
 frame_stride = 4         # keep 1 every N frames
+
+CLAP_MODEL = "laion/clap-htsat-unfused"
+AUDIO_CHUNK_SECONDS = 10   # CLAP (htsat) processes ~10s windows
+AUDIO_BATCH_CHUNKS = 16
 
 model, preprocess = clip.load(model_name, device=device)
 model.eval()
@@ -26,6 +30,7 @@ AUDIO_DIR = Path(f"{DATA_DIR}/audios")
 TEXT_DIR  = Path(f"{DATA_DIR}/texts")
 EMBED_DIR = Path(f"{DATA_DIR}/embeddings")
 FRAME_DIR = Path(f"{DATA_DIR}/frames")
+AUDIO_EMBED_DIR = Path(f"{DATA_DIR}/audio_embeddings")
 
 CINEMATIC_PROMPTS = [
     "music",
@@ -230,14 +235,60 @@ def extract_frame_embed():
         np.save(output_path, final_embs)
 
 
+@torch.no_grad()
+def extract_audio_embed():
+    """Precompute CLAP audio-embedding sequences: each audio file is split into
+    ~10s windows and encoded to a (num_chunks, 512) array, mirroring the
+    per-frame CLIP embedding sequences."""
+    clap = ClapModel.from_pretrained(CLAP_MODEL).to(device).eval()
+    processor = ClapProcessor.from_pretrained(CLAP_MODEL)
+    sr = processor.feature_extractor.sampling_rate  # CLAP expects 48kHz
+
+    audio_files = sorted(AUDIO_DIR.glob("*.mp3"))
+    print(f"Found {len(audio_files)} audio files for CLAP embedding. device: {device}")
+
+    chunk_len = AUDIO_CHUNK_SECONDS * sr
+    min_len = sr  # skip tail chunks shorter than 1s
+
+    for audio_path in tqdm(audio_files, desc="CLAP audio embeddings"):
+        audio_id = audio_path.stem
+        output_path = AUDIO_EMBED_DIR / f"{audio_id}.npy"
+
+        if output_path.exists():
+            continue
+
+        wav, _ = librosa.load(str(audio_path), sr=sr, mono=True)  # resamples 16k -> 48k
+
+        chunks = [wav[s:s + chunk_len] for s in range(0, len(wav), chunk_len)]
+        chunks = [c for c in chunks if len(c) >= min_len]
+        if not chunks:
+            chunks = [wav]
+
+        all_embeddings = []
+        for i in range(0, len(chunks), AUDIO_BATCH_CHUNKS):
+            group = chunks[i:i + AUDIO_BATCH_CHUNKS]
+            inp = processor(audio=group, sampling_rate=sr, return_tensors="pt")
+            inp = {k: v.to(device) for k, v in inp.items()}
+
+            pooled = clap.audio_model(**inp).pooler_output   # (B, 768)
+            embs = clap.audio_projection(pooled)             # (B, 512) CLAP space
+            embs = embs / embs.norm(dim=-1, keepdim=True)
+            all_embeddings.append(embs.cpu())
+
+        final_embs = torch.cat(all_embeddings, dim=0).numpy()
+        np.save(output_path, final_embs)
+
+
 def process_workflow():
     extract_text_audio()
     extract_frame_embed()
+    extract_audio_embed()
 
 if __name__ == "__main__":
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     TEXT_DIR.mkdir(parents=True, exist_ok=True)
     EMBED_DIR.mkdir(parents=True, exist_ok=True)
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIO_EMBED_DIR.mkdir(parents=True, exist_ok=True)
 
     process_workflow()

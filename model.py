@@ -78,15 +78,24 @@ FUSION_OPTIONS = ("cross_attn", "concat", "add", "film")
 
 
 class MultiModalSceneClassifier(nn.Module):
-    def __init__(self, clip_dim, num_tags, fusion="cross_attn", text_model=DEFAULT_TEXT_MODEL):
+    def __init__(self, clip_dim, num_tags, audio_dim, fusion="cross_attn", text_model=DEFAULT_TEXT_MODEL):
         super().__init__()
         assert fusion in FUSION_OPTIONS, f"fusion must be one of {FUSION_OPTIONS}"
         self.fusion = fusion
 
+        # vision is the primary ("content") stream
         self.frame_encoder = VisualTransformer(clip_dim)
+
+        # text and audio are pooled "context" streams that condition vision
         self.text_encoder = AutoModel.from_pretrained(text_model)
         text_dim = self.text_encoder.config.hidden_size
         self.text_proj = nn.Linear(text_dim, clip_dim)
+
+        self.audio_encoder = VisualTransformer(audio_dim)
+        self.audio_proj = nn.Linear(audio_dim, clip_dim)
+
+        # combine the text and audio context vectors into a single conditioner
+        self.context_proj = nn.Linear(clip_dim * 2, clip_dim)
 
         if fusion == "cross_attn":
             self.cross_attn = nn.MultiheadAttention(embed_dim=clip_dim, num_heads=8, batch_first=True)
@@ -114,7 +123,7 @@ class MultiModalSceneClassifier(nn.Module):
             nn.Linear(512, num_tags),
         )
 
-    def forward(self, frames, visual_masks, input_ids, attention_mask):
+    def forward(self, frames, visual_masks, input_ids, attention_mask, audio, audio_masks):
         v_tokens, v_mask = self.frame_encoder(frames, visual_masks)
         v_cls = v_tokens[:, 0]
 
@@ -122,21 +131,27 @@ class MultiModalSceneClassifier(nn.Module):
         t_pooled = masked_mean_pool(text_out.last_hidden_state, attention_mask)
         t_cls = self.text_proj(t_pooled)
 
+        a_tokens, _ = self.audio_encoder(audio, audio_masks)
+        a_cls = self.audio_proj(a_tokens[:, 0])
+
+        # text + audio -> single conditioning context for the visual stream
+        ctx = self.context_proj(torch.cat([t_cls, a_cls], dim=-1))
+
         if self.fusion == "cross_attn":
             fused, _ = self.cross_attn(
-                query=t_cls.unsqueeze(1),
+                query=ctx.unsqueeze(1),
                 key=v_tokens,
                 value=v_tokens,
                 key_padding_mask=v_mask,
             )
             fused = self.norm(fused.squeeze(1))
         elif self.fusion == "concat":
-            fused = self.norm(self.fusion_proj(torch.cat([v_cls, t_cls], dim=-1)))
+            fused = self.norm(self.fusion_proj(torch.cat([v_cls, ctx], dim=-1)))
         elif self.fusion == "add":
-            fused = self.norm(v_cls + t_cls)
+            fused = self.norm(v_cls + ctx)
         elif self.fusion == "film":
-            scale = self.film_scale(t_cls)
-            shift = self.film_shift(t_cls)
+            scale = self.film_scale(ctx)
+            shift = self.film_shift(ctx)
             fused = self.norm(scale * v_cls + shift)
 
         return self.head(fused)
@@ -179,5 +194,29 @@ class VisionSceneClassifier(nn.Module):
         v_tokens, v_mask = self.frame_encoder(frames, visual_masks)
         v_cls = v_tokens[:, 0]
         logits = self.head(v_cls)
+
+        return logits
+
+
+class AudioSceneClassifier(nn.Module):
+    def __init__(self, audio_dim, num_tags):
+        super().__init__()
+
+        # CLAP embeddings form a per-window sequence; reuse the generic
+        # sequence transformer (same architecture as the visual encoder).
+        self.audio_encoder = VisualTransformer(audio_dim)
+
+        self.head = nn.Sequential(
+            nn.Linear(audio_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_tags),
+        )
+
+    def forward(self, audio, audio_masks):
+        a_tokens, a_mask = self.audio_encoder(audio, audio_masks)
+        a_cls = a_tokens[:, 0]
+        logits = self.head(a_cls)
 
         return logits
